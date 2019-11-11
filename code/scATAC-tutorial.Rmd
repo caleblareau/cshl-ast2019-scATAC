@@ -1,0 +1,321 @@
+---
+title: Analyzing droplet-based single-cell ATAC-seq data
+author: CSHL Advanced Sequencing Technologies
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    theme: readable
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+  
+  
+```{r wd, cache=FALSE, message=FALSE, warning = FALSE, echo = FALSE}
+if (basename(getwd()) != "code") setwd("code")
+```
+
+# First, make sure data is downloaded and that requisite packages are installed.
+
+Navigate to the `data` folder and run the shell script to get the fragments file (> 100Mb)
+
+
+Run this code block below to verify that everything is installed; if not, run specific commands below to have a new install. While these installations are running, check out the `10x` QC report in `../data` [(also available here)](http://cf.10xgenomics.com/samples/cell-atac/1.1.0/atac_pbmc_1k_nextgem/atac_pbmc_1k_nextgem_web_summary.html)
+
+
+```{r packages, cache=FALSE, message=FALSE, warning = FALSE, echo = TRUE, eval=TRUE}
+library(Seurat)
+library(Signac)
+library(chromVAR)
+library(motifmatchr)
+library(SummarizedExperiment)
+library(Matrix)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(viridis)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(EnsDb.Hsapiens.v75)
+
+if(FALSE){
+  
+  # CRAN packages
+  install.packages("Seurat")
+  install.packages("magrittr")
+  install.packages("ggplot2")
+  install.packages("viridis")
+  
+  # Dev packages
+  install.packages("devtools")
+  devtools::install_github("timoast/signac")
+  
+  # Biocondcutor packages
+  install.packages("BiocManager")
+  BiocManager::install('chromVAR')
+   BiocManager::install('motifmatchr')
+  BiocManager::install( 'BSgenome.Hsapiens.UCSC.hg19')
+  BiocManager::install('EnsDb.Hsapiens.v75')
+}
+
+```
+<br><br>
+
+### Questions to think about from the 10x QC report
+
+- What are cells with with very high fragment abundance but very low percentage of reads in peaks?
+- Why is there a 'bump' around position ~200 in the TSS enrichment plot?
+- What fraction of reads map to the mitochondrial genome? Is this lower or higher than we'd expect with ATAC-seq?
+- Are these libraries sequenced to saturation? 
+
+For more on point 1, [read here](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5509561/), specifically paragraph number 2 of "Cell-type-specific spatial organization of the accessible genome."
+
+
+# File formats
+These are all emitted from a standard 10x CellRanger-ATAC run as well as other droplet-based ATAC processing pipelines. 
+
+### Fragments file
+A (perhaps) unfamiliar file format that comes as part of the default 10x scATAC-seq processing is a `fragments.tsv` file. You can read about it [more here](https://support.10xgenomics.com/single-cell-atac/software/pipelines/latest/output/fragments). Let's take alook:
+
+```{r data_fragments, cache=FALSE, message=FALSE, warning = FALSE, echo = FALSE}
+fread("../data/atac_pbmc_1k_nextgem_fragments.tsv.gz", nrows = 10, header = FALSE, col.names = c("chr", "start", "end", "barcode", "nDup"))
+```
+
+A couple of useful tidbits:
+- The fragments from this file have been offset to account for Tn5 insertions and their asymmetry (i.e. +4 and -5), meaning the edges can be used for footprinting directly.
+- The last column indicates the number PCR duplications that are observed (with the same barcode). However, fragments that map to multiple barcodes are filtered from this file. 
+- Reads mapping to blacklisted regions are retained and may need to be filtered in some downstream processes.
+- Chimeric reads or reads with a long insert are removed. 
+
+**More often than not, I get all of my information from this file for downstream analyses**. Though an analogous file does not exist for scRNA-seq, I absolutely recommend becoming familiar and comfortable utilizing and manipulating this file for most purposes (e.g. computing a peaks x cells matrix with a new peak set).
+
+### More familiar looking files
+
+The contents of the `filtered_peak_bc_matrix` matches what is familiar to processing pipelines of scRNA-seq with the exception that the feature set (here: peaks; in RNA-seq, genes) is different between experiments, even with the same reference.
+
+
+```{r data_import, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+# import files
+dir <- "../data/filtered_peak_bc_matrix/"
+barcodes <- fread(paste0(dir, "barcodes.tsv"), header = FALSE)[[1]]
+peaks <- fread(paste0(dir, "peaks.bed"), header = FALSE, col.names = c("chr", "start", "end"))
+mat <- fread(paste0(dir, "matrix.mtx.gz"), skip = 3, header = FALSE)
+```
+
+```{r data_showcase, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+# Barcodes look like we'd expect
+head(barcodes)
+
+# Sparse matrix encoding of data...
+head(mat)
+
+# Peaks (featureset)... as called by CellRanger
+head(peaks)
+
+# Now let's look at the distribution of peak widths...
+qplot(peaks$end - peaks$start) + scale_x_log10() + labs(x = "Width of peak (log10)", y = "count")
+```
+
+Notice the wide distribution of the width of peaks-- this can yield potential artifacts depending on the exact nature of analysis. 
+
+# R data structures
+Two of the standard objects for analysis of ATAC-seq are a RangedSummarizedExperiment (e.g. for use with chromVAR) and a Seurat object (for use with Signac and Seurat). Here are some custom functions that allow us to see how these data can be imported into R. The overall flow of these functions are quite similar. 
+
+```{r data_import_functions, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+import_10xATAC_SE <- function(dir, summary_csv){
+  
+  # import files
+  barcodes <- fread(paste0(dir, "barcodes.tsv"), header = FALSE)[[1]]
+  peaks <- fread(paste0(dir, "peaks.bed"), header = FALSE, col.names = c("chr", "start", "end"))
+  peaks_gr <- makeGRangesFromDataFrame(peaks)
+  matdt <- fread(paste0(dir, "matrix.mtx.gz"), skip = 3, header = FALSE)
+  
+  # Add an extra 0 to ensure the dimension is like we want in creating a sparse matrix
+  mat <- Matrix::sparseMatrix(i = c(matdt[[1]],length(peaks)), 
+                              j = c(matdt[[2]],length(barcodes)),
+                              x = c(matdt[[3]], 0))
+  colnames(mat) <- barcodes
+  
+  # Create colData using the summary csv
+  summary_csv <- data.frame(fread("../data/atac_pbmc_1k_nextgem_singlecell.csv"))
+  colData <- merge(data.frame(barcode = barcodes), summary_csv, all.y = FALSE)
+  
+  # Create a summarized experiment
+  SE <- SummarizedExperiment(
+    rowRanges = peaks_gr,
+    colData = data.frame(barcode = barcodes),
+    assays = list(counts = mat)
+  )
+}
+
+import_10xATAC_seurat <- function(dir, summary_csv){
+  
+  # import files
+  barcodes <- fread(paste0(dir, "barcodes.tsv"), header = FALSE)[[1]]
+  peaks <- fread(paste0(dir, "peaks.bed"), header = FALSE, col.names = c("chr", "start", "end"))
+  rownames <- paste0(peaks$chr, ":", as.character(peaks$start), "-", as.character(peaks$end))
+  matdt <- fread(paste0(dir, "matrix.mtx.gz"), skip = 3, header = FALSE)
+  
+  # Add an extra 0 to ensure the dimension is like we want in creating a sparse matrix
+  mat <- Matrix::sparseMatrix(i = c(matdt[[1]],length(peaks)), 
+                              j = c(matdt[[2]],length(barcodes)),
+                              x = c(matdt[[3]], 0))
+  rownames(mat) <- rownames
+  colnames(mat) <- barcodes
+  
+  # Create the object
+  summary_csv <- read.csv("../data/atac_pbmc_1k_nextgem_singlecell.csv", row.names = 1, header = TRUE)
+  pbmc2 <- CreateSeuratObject(
+    counts = mat,
+    assay = 'peaks',
+    project = 'ATAC',
+    min.cells = 0,
+    meta.data = summary_csv
+  )
+}
+
+seurat_atac <- import_10xATAC_seurat("../data/filtered_peak_bc_matrix/", "../data/atac_pbmc_1k_nextgem_singlecell.csv")
+se_atac <- import_10xATAC_SE("../data/filtered_peak_bc_matrix/", "../data/atac_pbmc_1k_nextgem_singlecell.csv")
+
+```
+
+These objects are quite similar
+
+```{r filter_cells, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+seurat_atac$pct_reads_in_peaks <- seurat_atac$peak_region_fragments / seurat_atac$passed_filters * 100
+
+qplot(log10(seurat_atac$passed_filters),seurat_atac$pct_reads_in_peaks) +
+  labs(y = "% reads in peaks", x = "log10 # of fragments") +
+  geom_hline(yintercept = 60, color = "firebrick") +
+  geom_vline(xintercept = log10(5000), color = "firebrick")
+
+# Filter object
+pbmc <- subset(seurat_atac, subset =pct_reads_in_peaks > 60 & passed_filters > 5000)
+dim(pbmc)
+
+```
+
+# Dimensionality reduction and clustering with Signac
+
+
+```{r run_dimension_reduction2, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+
+# Normalization
+pbmc <- RunTFIDF(pbmc, method = 1) # there winds up being very little differences in the four methods
+
+# Filter for variable features
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q50')
+
+# Run linear dimension reduction (very similar to PCA)
+pbmc <- RunSVD(
+  object = pbmc,
+  assay = 'peaks',
+  reduction.key = 'LSI_',
+  reduction.name = 'lsi'
+)
+
+# Next commands 
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 1:30)
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 1:30)
+pbmc <- FindClusters(object = pbmc, verbose = FALSE)
+DimPlot(object = pbmc, label = TRUE) + NoLegend()
+```
+
+
+## Compute gene scores using Signac
+
+This code chunk takes about 3-4 minutes on my machine. 
+```{r compute_gene_scores, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+gene.coords <- genes(EnsDb.Hsapiens.v75, filter = ~ gene_biotype == "protein_coding")
+seqlevelsStyle(gene.coords) <- 'UCSC'
+genebody.coords <- keepStandardChromosomes(gene.coords, pruning.mode = 'coarse')
+genebodyandpromoter.coords <- Extend(x = gene.coords, upstream = 2000, downstream = 0)
+
+# create a gene by cell matrix
+gene.activities <- FeatureMatrix(
+  fragments = "../data/atac_pbmc_1k_nextgem_fragments.tsv.gz",
+  features = genebodyandpromoter.coords,
+  cells = colnames(pbmc),
+  chunk = 5
+)
+
+# convert rownames from chromsomal coordinates into gene names
+gene.key <- genebodyandpromoter.coords$gene_name
+names(gene.key) <- GRangesToString(grange = genebodyandpromoter.coords)
+rownames(gene.activities) <- gene.key[rownames(gene.activities)]
+
+# add the gene activity matrix to the Seurat object as a new assay, and normalize it
+pbmc[['RNA']] <- CreateAssayObject(counts = gene.activities)
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_RNA)
+)
+```
+
+## Dimensionality reduction with chromVAR
+
+This code chunk takes 2-3 minutes on my machine
+```{r chromvar_run, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+# Subset down to similar cells and filter peaks for chromVAR
+se_filtered <- filterPeaks(se_atac[,colnames(pbmc)], non_overlapping = TRUE)
+motifs <- getJasparMotifs()
+
+se_filtered <- addGCBias(se_filtered, 
+                            genome = BSgenome.Hsapiens.UCSC.hg19)
+
+motif_ix <- matchMotifs(motifs, se_filtered, 
+                        genome = BSgenome.Hsapiens.UCSC.hg19)
+dev <- computeDeviations(object = se_filtered, annotations = motif_ix)
+tsne_results <- deviationsTsne(dev, threshold = 1.5)
+
+```
+
+## Compare two with marker gene annotations for NK cells
+
+We can also look for other PBMC marker genes with these data frames
+```{r compare2, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+chromvar_df <- data.frame(
+  tsne_results,
+   t(pbmc@assays[["RNA"]]@counts)
+)
+
+signac_df <- data.frame(
+  pbmc@reductions$umap@cell.embeddings, 
+  t(pbmc@assays[["RNA"]]@counts)
+)
+
+ggplot(chromvar_df, aes(x= X1, y = X2, color = log2(NCR1 + 1))) +
+  geom_point() + scale_color_viridis() +
+  labs(x = "chromVAR tSNE1", y = "chromVAR tSNE2")
+
+ggplot(signac_df, aes(x= UMAP_1, y = UMAP_2, color =  log2(NCR1 + 1))) +
+  geom_point() + scale_color_viridis() +
+  labs(x = "Signac UMAP1", y = "Signac UMAP2")
+
+```
+
+
+
+### Additional resources
+- [Integration and label transfering with RNA-seq / Signac](https://satijalab.org/signac/articles/pbmc_vignette.html) 
+- [Cicero](https://cole-trapnell-lab.github.io/cicero-release/docs_m3/) provides functionality for pseudotime, enhancer-gene connections, and much more.
+- [Batch correction and integration / Signac](https://satijalab.org/signac/articles/integration.html)
+- Andrew Hill has a [very useful blogpost](http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/) that constrasts possible versions of LSI.
+- [Dimension reduction and analyses with CisTopics](https://rawcdn.githack.com/aertslab/cisTopic/8d15fa2813312aa0b20c1042604079558829e947/vignettes/10X_workflow.html). The tool works well but is relatively slow and hard to use with larger datasets. 
+
+**I've ranked these roughly in terms of how immediately useful I could envision them being used for a new user.**
+
+### Other useful tools
+- [SnapATAC](https://github.com/r3fang/SnapATAC) provides a computationally efficient processing of data and many useful functionalities.
+- [EpiScanpy](https://github.com/colomemaria/epiScanpy) is a new tool building off of the popular python tool Scanpy for single-cell epigenomics data analysis. 
+- [HINT software](https://www.regulatory-genomics.org/hint/tutorial/) for TF footprinting analyses. (currently undemonstrated with single-cell data)
+
+
+### Acknowledgements
+Many parts of this exercise relied heavily on functions and vignettes created by Tim Stuart, the creator of the [Signac package](https://satijalab.org/signac/articles/pbmc_vignette.html) and Alicia Schep, the creator of the [chromVAR package](https://greenleaflab.github.io/chromVAR/). <br>
+
+<br> 
+_Contact:_ [email Caleb, instructor](mailto:caleblareau@g.harvard.edu)
+<br><br>
+<br><br>

@@ -2,6 +2,9 @@
 .Rhistory
 .Rapp.history
 
+# Big fragments file
+data/atac_pbmc_1k_nextgem_fragments.tsv.gz
+
 # Session Data files
 .RData
 
@@ -27,6 +30,7 @@ vignettes/*.pdf
 # knitr and R markdown default cache directories
 /*_cache/
 /cache/
+code/scATAC-tutorial_cache/*
 
 # Temporary files created by R markdown
 *.utf8.md
