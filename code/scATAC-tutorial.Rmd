@@ -1,5 +1,5 @@
 ---
-title: Analyzing droplet-based single-cell ATAC-seq data
+title: Analysis single-cell ATAC-seq data
 author: CSHL Advanced Sequencing Technologies
 date: "`r Sys.Date()`"
 output:
@@ -17,10 +17,9 @@ if (basename(getwd()) != "code") setwd("code")
 
 # First, make sure data is downloaded and that requisite packages are installed.
 
-Navigate to the `data` folder and run the shell script to get the fragments file (> 100Mb)
+Navigate to the `data` folder and run the shell script to get the fragments file (> 100Mb), which will be used for computing gene scores. 
 
-
-Run this code block below to verify that everything is installed; if not, run specific commands below to have a new install. While these installations are running, check out the `10x` QC report in `../data` [(also available here)](http://cf.10xgenomics.com/samples/cell-atac/1.1.0/atac_pbmc_1k_nextgem/atac_pbmc_1k_nextgem_web_summary.html)
+Next, run this code block below to verify that everything is installed; if not, run specific commands below to have a new install. 
 
 
 ```{r packages, cache=FALSE, message=FALSE, warning = FALSE, echo = TRUE, eval=TRUE}
@@ -60,18 +59,23 @@ if(FALSE){
 ```
 <br><br>
 
+# 10x QC report
+
+While these installations and downloadds are running, check out the `10x` QC report in `../data` [(also available here)](http://cf.10xgenomics.com/samples/cell-atac/1.1.0/atac_pbmc_1k_nextgem/atac_pbmc_1k_nextgem_web_summary.html). Look over the report and try to understand what the metrics represent. 
+
 ### Questions to think about from the 10x QC report
 
 - What are cells with with very high fragment abundance but very low percentage of reads in peaks?
 - Why is there a 'bump' around position ~200 in the TSS enrichment plot?
 - What fraction of reads map to the mitochondrial genome? Is this lower or higher than we'd expect with ATAC-seq?
 - Are these libraries sequenced to saturation? 
+- How are PCR duplicates determined in this assay?
 
 For more on point 1, [read here](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5509561/), specifically paragraph number 2 of "Cell-type-specific spatial organization of the accessible genome."
-
+<br><br>
 
 # File formats
-These are all emitted from a standard 10x CellRanger-ATAC run as well as other droplet-based ATAC processing pipelines. 
+These are all emitted from a standard 10x CellRanger-ATAC run as well as other droplet-based ATAC processing pipelines. I expect these to be the standard file formats moving forward.  
 
 ### Fragments file
 A (perhaps) unfamiliar file format that comes as part of the default 10x scATAC-seq processing is a `fragments.tsv` file. You can read about it [more here](https://support.10xgenomics.com/single-cell-atac/software/pipelines/latest/output/fragments). Let's take alook:
@@ -117,8 +121,10 @@ qplot(peaks$end - peaks$start) + scale_x_log10() + labs(x = "Width of peak (log1
 
 Notice the wide distribution of the width of peaks-- this can yield potential artifacts depending on the exact nature of analysis. 
 
+<br><br>
+
 # R data structures
-Two of the standard objects for analysis of ATAC-seq are a RangedSummarizedExperiment (e.g. for use with chromVAR) and a Seurat object (for use with Signac and Seurat). Here are some custom functions that allow us to see how these data can be imported into R. The overall flow of these functions are quite similar. 
+Two of the standard objects for analysis of ATAC-seq are a [RangedSummarizedExperiment](https://www.bioconductor.org/packages/devel/bioc/vignettes/SummarizedExperiment/inst/doc/SummarizedExperiment.html) (e.g. for use with chromVAR) and a Seurat object (for use with Signac and Seurat). Here are some custom functions that allow us to see how these data can be imported into R. The overall flow of these functions are quite similar. 
 
 ```{r data_import_functions, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
 import_10xATAC_SE <- function(dir, summary_csv){
@@ -178,15 +184,35 @@ se_atac <- import_10xATAC_SE("../data/filtered_peak_bc_matrix/", "../data/atac_p
 
 ```
 
-These objects are quite similar
+### Comparison of the objects
+
+These objects are quite similar representation of the data. However, some differencecs do exist. Notably, the rowspace of the Summarized Experiment object is a GenomicRanges object, which makes accessing sequences (e.g. motifs; GC content) extremely easy. The Seurat object is a more comprehensive object that provides a hierarchical representation of all elements of the scATAC-seq analysis. 
+
+
+```{r misc_dim, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+dim(se_atac)
+dim(seurat_atac)
+```
+
+
+<br><br>
+
+# Filtering cells
+
+There are a variety of metrics that one can use to filter cells for downstream analysis. Most commonly, these are used: 1) the total number of high-quality fragments captured for the cell (in this case, the `passed_filter` number reported by CellRanger); 2) the proportion of fragments that map to an expected accessible chromatin region. Most conveniently, this is usually the fraction of reads in peaks (FRIP); however, other metrics such as proportion of reads overlapping annotated transcription start sites (TSSs) can provide a more consistent interpretation of results from experiment to experiment (but we can also observe that these metrics are highly correlated).
 
 ```{r filter_cells, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
 seurat_atac$pct_reads_in_peaks <- seurat_atac$peak_region_fragments / seurat_atac$passed_filters * 100
+seurat_atac$pct_reads_in_TSS <- seurat_atac$TSS_fragments / seurat_atac$passed_filters * 100
 
 qplot(log10(seurat_atac$passed_filters),seurat_atac$pct_reads_in_peaks) +
-  labs(y = "% reads in peaks", x = "log10 # of fragments") +
+  labs(x = "log10 # of fragments", y = "% reads in peaks") +
   geom_hline(yintercept = 60, color = "firebrick") +
   geom_vline(xintercept = log10(5000), color = "firebrick")
+
+qplot(seurat_atac$pct_reads_in_TSS,seurat_atac$pct_reads_in_peaks) +
+  labs(x = "% reads in TSS", y = "% reads in peaks") +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = "firebrick")
 
 # Filter object
 pbmc <- subset(seurat_atac, subset =pct_reads_in_peaks > 60 & passed_filters > 5000)
@@ -194,15 +220,33 @@ dim(pbmc)
 
 ```
 
+### Questions to think about
+- How do we interpret cells below the dotten red line? 
+- As an approximation, how many reads are in enhancers, promoters, and neither?
+
+
+<br><br>
+
 # Dimensionality reduction and clustering with Signac
 
+Utilizing the Signac object, we can call nice wrapper functions to go from our high-dimensional chromatin accessibility data to a two-dimensional cell embedding with possible cell types identified using graph-based clustering. 
 
-```{r run_dimension_reduction2, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+The [TF-IDF](http://www.tfidf.com/) (term frequency-inverse document frequency) functionality provides a normalization of the data. While in theory, TF-IDF has a singular interpretation, but in scATAC-seq analyses, there's been a few modifications of it that have lead to some confusion-- [see this useful blogpost](http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/). The Signac authors provide four such implementations of TF-IDF; these yield roughly the same thing. 
+
+
+```{r run_dimension_reduction_tfidf, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
 
 # Normalization
-pbmc <- RunTFIDF(pbmc, method = 1) # there winds up being very little differences in the four methods
+# there winds up being very little differences in the four methods from my evaluation
+pbmc <- RunTFIDF(pbmc, method = 1) 
+```
 
-# Filter for variable features
+After completing this normalization, we can perform subsequent steps like finding variable features, linear dimension reduction via SVD (similar to PCA), graph-based clustering, and two-dimensional manifold embedding. 
+
+Note: This code chunk takes about 2 minutes on my machine. 
+```{r run_dimension_reduction_rest, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+
+# Filter for variable feature
 pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q50')
 
 # Run linear dimension reduction (very similar to PCA)
@@ -213,17 +257,25 @@ pbmc <- RunSVD(
   reduction.name = 'lsi'
 )
 
-# Next commands 
+# Commands for a 2D embedding and graph-based clustering
 pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 1:30)
 pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 1:30)
 pbmc <- FindClusters(object = pbmc, verbose = FALSE)
 DimPlot(object = pbmc, label = TRUE) + NoLegend()
 ```
 
+Here, we see that this approach nicely picks out ~8-9 clusters using a standard workflow. 
 
-## Compute gene scores using Signac
+<br><br>
 
-This code chunk takes about 3-4 minutes on my machine. 
+# Compute gene scores using Signac
+
+There have been several proposed methods for computing gene scores from scATAC-seq data. The basic idea is that we want to count accessibel chromatin fragments proximal to annotated gene bodies. These fragments may or may not be weighted. When they are, typical weights include correlation to the promoter of the target gene or the distance from the center of the fragment to the TSS. The most sophisticaed is [Cicero](https://cole-trapnell-lab.github.io/cicero-release/docs_m3/), which utilizes a penalized correlation metric between enhancers and genes to compute these gene scores. What turns out to be the most effective (in my opinion and has been shown in some supplemental figures) is a basic idea introducted in Seurat/Signac to just count all fragments overlapping the gene body extended by 2kb (to include the promoter). This is computationally very efficient to compute. Additionally, this doesn't rely on peaks for inference, which is very advantageous for merging datasets. 
+
+In the code chunk below, we use Signac to compute gene scores. The input requires the fragments file, discussed above. 
+
+Note: This code chunk takes about 3-4 minutes on my machine. 
+
 ```{r compute_gene_scores, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
 gene.coords <- genes(EnsDb.Hsapiens.v75, filter = ~ gene_biotype == "protein_coding")
 seqlevelsStyle(gene.coords) <- 'UCSC'
@@ -253,27 +305,58 @@ pbmc <- NormalizeData(
 )
 ```
 
+By saving the gene score (pseudo-expression) counts in the RNA slot of the Seurat object, this structure is ready for integration with scRNA-seq data (see vignette URL at the end of the tutorial).
+
+<br><br>
+
 ## Dimensionality reduction with chromVAR
 
-This code chunk takes 2-3 minutes on my machine
+In contrast to the LSI-based dimension reduction used in Signac, we can compute meta-features that have an interpretable biological meaning via the chromVAR algorithm. More explicitly, chromVAR utilizes pre-defined transcription factor motifs to determine whether we observe more (positive z-score) or less (negative z-score) accessibility per cell than we'd expect under a null model. This approach is very useful for identifying master regulators of specific cell types and has been used in the past to inform dimension reduction and separation of cell types. 
+
+The series of functions used in chromVAR are to 1) annotate peaks with GC content as part of the background model; 2) identify TF motifs in the peak set; 3) idnetify variable motifs above some cutoff; 4) perform a final dimension reduction into a two-dimensional space (via t-SNE). These steps are shown below:
+
+Note: this code chunk takes 2-3 minutes on my machine
 ```{r chromvar_run, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+
 # Subset down to similar cells and filter peaks for chromVAR
 se_filtered <- filterPeaks(se_atac[,colnames(pbmc)], non_overlapping = TRUE)
+
+# Import the motifs from JASPAR 2016 for humans (default)
 motifs <- getJasparMotifs()
 
+# Add the GC content of each peak to the summarized experiment object
 se_filtered <- addGCBias(se_filtered, 
                             genome = BSgenome.Hsapiens.UCSC.hg19)
 
+# Assemble
 motif_ix <- matchMotifs(motifs, se_filtered, 
                         genome = BSgenome.Hsapiens.UCSC.hg19)
 dev <- computeDeviations(object = se_filtered, annotations = motif_ix)
+
+# Compute variability of
+variability <- computeVariability(dev)
+plotVariability(variability, use_plotly = TRUE) 
+
+# Perform a 2D embedding (note: UMAP is not internall supported in chromVAR)
 tsne_results <- deviationsTsne(dev, threshold = 1.5)
 
+dim(se_filtered)
+dim(motif_ix)
+dim(dev)
 ```
+
+### Questions to think about from chromVAR execution
+- What do the dimensions of these objects at the end of the code chunk represent?
+- The `BSgenome.Hsapiens.UCSC.hg19` genome object is passed to both `addGCBias` and `matchMotifs`. What purpose is the object serving in each function?
+- What would happen if we supplied the wrong `BSgenome` object? 
+- What is the most variable TF motif in this sample? Does this make biological sense? 
+
+<br><br>
 
 ## Compare two with marker gene annotations for NK cells
 
-We can also look for other PBMC marker genes with these data frames
+To compare the efficacy of the two approaches (chromVAR, Signac), we will visualize the reduced dimensions (tSNE, UMAP) for the same population of cells (enforced above) and annotate cells with known marker genes for different cell types of PBMCs. Here, we will examine NCR1, a marker gene for Natural Killer cells. 
+
 ```{r compare2, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
 chromvar_df <- data.frame(
   tsne_results,
@@ -295,27 +378,64 @@ ggplot(signac_df, aes(x= UMAP_1, y = UMAP_2, color =  log2(NCR1 + 1))) +
 
 ```
 
+Note: we can also look for other PBMC marker genes with these data frames (e.g. PAX5)
 
+```{r viz_pax5, cache=TRUE, message=FALSE, warning = FALSE, echo = TRUE}
+ggplot(chromvar_df, aes(x= X1, y = X2, color = log2(PAX5 + 1))) +
+  geom_point() + scale_color_viridis() +
+  labs(x = "chromVAR tSNE1", y = "chromVAR tSNE2")
 
-### Additional resources
-- [Integration and label transfering with RNA-seq / Signac](https://satijalab.org/signac/articles/pbmc_vignette.html) 
+ggplot(signac_df, aes(x= UMAP_1, y = UMAP_2, color =  log2(PAX5 + 1))) +
+  geom_point() + scale_color_viridis() +
+  labs(x = "Signac UMAP1", y = "Signac UMAP2")
+
+```
+
+From this, note the following:
+
+- Gene scores are an independent annotation function (i.e. it's not circular that the color co-localizes with specific parts of a cluster). 
+- chromVAR successfully separates the major distinct celltypes (B-cells, T-cells, and Myeloid cells) in peripheral blood. However, it has limited resolution to identify other populations that require a more refined understanding (T-cells).
+- The Signac workflow (specifically, using LSI) recovers the NK T-cell cluster more distinctly. 
+
+### Questions to consider
+- What are the feature sets for each workflow? Does either one indicate intrinsically  
+- Under what circumstances could chromVAR give 'cleaner' signal than the LSI workflow? 
+- Why do we log-scale the gene scores for visualization? 
+- What is the specificity of the features used in gene scores compared to transcripts in scRNA-seq? Are there scenarios where one may be preferred over the other?
+
+<br><br>
+
+# Summary
+Key points to remember and review from this exercise:
+
+- Importing data into R and applicable data structures for scATAC-seq
+- How to interpret QC parameters from the 10x scATAC report
+- Use of the fragments file in analyses (e.g. gene scoring) and other potential applications
+- Parameters for filtering cells 
+- How to perform dimensionality reduction using different packages (Signac / chromVAR) and what drives the dimension reduction in each technique
+<br><br>
+
+# Additional resources
+- [Integration and label transfering with RNA-seq / Signac](https://satijalab.org/signac/articles/pbmc_vignette.html). This also discusses how to generate accessible chromatin tracks by simply extending the workflow here. 
 - [Cicero](https://cole-trapnell-lab.github.io/cicero-release/docs_m3/) provides functionality for pseudotime, enhancer-gene connections, and much more.
 - [Batch correction and integration / Signac](https://satijalab.org/signac/articles/integration.html)
 - Andrew Hill has a [very useful blogpost](http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/) that constrasts possible versions of LSI.
 - [Dimension reduction and analyses with CisTopics](https://rawcdn.githack.com/aertslab/cisTopic/8d15fa2813312aa0b20c1042604079558829e947/vignettes/10X_workflow.html). The tool works well but is relatively slow and hard to use with larger datasets. 
 
-**I've ranked these roughly in terms of how immediately useful I could envision them being used for a new user.**
+**Above, I've ranked these roughly in terms of how useful I could envision them being used for a new user.**
+<br>
 
-### Other useful tools
+## Other useful tools
 - [SnapATAC](https://github.com/r3fang/SnapATAC) provides a computationally efficient processing of data and many useful functionalities.
 - [EpiScanpy](https://github.com/colomemaria/epiScanpy) is a new tool building off of the popular python tool Scanpy for single-cell epigenomics data analysis. 
 - [HINT software](https://www.regulatory-genomics.org/hint/tutorial/) for TF footprinting analyses. (currently undemonstrated with single-cell data)
+- [Autoencoder framework for scATAC-seq](https://www.nature.com/articles/s41467-019-12630-7)
+<br><br>
 
-
-### Acknowledgements
+## Acknowledgements
 Many parts of this exercise relied heavily on functions and vignettes created by Tim Stuart, the creator of the [Signac package](https://satijalab.org/signac/articles/pbmc_vignette.html) and Alicia Schep, the creator of the [chromVAR package](https://greenleaflab.github.io/chromVAR/). <br>
 
 <br> 
-_Contact:_ [email Caleb, instructor](mailto:caleblareau@g.harvard.edu)
+_Contact:_ [email Caleb](mailto:caleblareau@g.harvard.edu), instructor
 <br><br>
 <br><br>
